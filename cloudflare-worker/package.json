@@ -1,0 +1,19 @@
+{
+  "name": "multi-region-traffic-router",
+  "version": "1.0.0",
+  "description": "Cloudflare Worker for Multi-Region Geo & Health-Aware Traffic Routing",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "build": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20231121.0",
+    "@types/node": "^26.2.0",
+    "ts-node": "^10.9.2",
+    "tsx": "^4.23.12",
+    "typescript": "^5.3.3",
+    "wrangler": "^3.19.0"
+  }
+}

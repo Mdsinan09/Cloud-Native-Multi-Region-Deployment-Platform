@@ -12,6 +12,7 @@ import authRoutes from './routes/auth';
 import appsRoutes from './routes/apps';
 import deploymentsRoutes from './routes/deployments';
 import webhooksRoutes from './routes/webhooks';
+import regionsRoutes from './routes/regions';
 
 dotenv.config();
 
@@ -33,6 +34,7 @@ app.use('/auth', authRoutes);
 app.use('/api/apps', appsRoutes);
 app.use('/api/deployments', deploymentsRoutes);
 app.use('/api/webhooks', webhooksRoutes);
+app.use('/api/regions', regionsRoutes);
 
 // Error handler (must be last)
 app.use(errorHandler);

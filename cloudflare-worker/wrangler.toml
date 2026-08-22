@@ -1,0 +1,13 @@
+name = "multi-region-traffic-router"
+main = "src/index.ts"
+compatibility_date = "2024-01-01"
+
+[vars]
+ADMIN_TOKEN = "your-admin-token-change-in-production"
+DEFAULT_FALLBACK_REGION = "us-east-1"
+HEALTH_CHECK_PATH = "/health"
+HEALTH_CHECK_TIMEOUT_MS = "2000"
+
+kv_namespaces = [
+  { binding = "REGION_CONFIG", id = "region_config_kv_id" }
+]
