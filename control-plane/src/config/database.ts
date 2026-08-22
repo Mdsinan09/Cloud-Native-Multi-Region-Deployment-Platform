@@ -63,6 +63,7 @@ export async function initDatabase(): Promise<void> {
         status VARCHAR(50) NOT NULL DEFAULT 'QUEUED',
         image_tag VARCHAR(255),
         region VARCHAR(50) DEFAULT 'us-east-1',
+        manifest_json JSONB,
         started_at TIMESTAMPTZ,
         completed_at TIMESTAMPTZ,
         rollback_to_deployment_id UUID REFERENCES deployments(id),

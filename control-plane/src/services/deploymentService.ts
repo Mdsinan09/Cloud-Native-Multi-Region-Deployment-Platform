@@ -153,6 +153,19 @@ export async function updateSubDeploymentStatus(
 }
 
 /**
+ * Store deployment manifest JSON in database
+ */
+export async function storeDeploymentManifest(
+  deploymentId: string,
+  manifest: object
+): Promise<void> {
+  await pool.query(
+    'UPDATE deployments SET manifest_json = $1 WHERE id = $2',
+    [JSON.stringify(manifest), deploymentId]
+  );
+}
+
+/**
  * Get the previous successful deployment for rollback
  */
 export async function getPreviousSuccessfulDeployment(
@@ -161,9 +174,9 @@ export async function getPreviousSuccessfulDeployment(
 ): Promise<Deployment | null> {
   const result = await pool.query(
     `SELECT * FROM deployments 
-     WHERE app_id = $1 AND id != $2 AND status = 'SUCCESS'
+     WHERE app_id = $1 AND id != $2 AND status = 'SUCCESS' AND manifest_json IS NOT NULL
      ORDER BY created_at DESC LIMIT 1`,
     [appId, currentDeploymentId]
   );
-  return result.rows[0] as Deployment || null;
+  return (result.rows[0] as Deployment) || null;
 }

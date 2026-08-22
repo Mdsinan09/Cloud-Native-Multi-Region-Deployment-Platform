@@ -1,13 +1,52 @@
 /**
- * Kubernetes Service
- * Handles manifest generation, application, rollout watching, and rollback
+ * Kubernetes Service - K3s Integration Layer
+ * Handles manifest generation, application, rollout polling, ingress extraction, and rollback
  */
 import * as k8s from '@kubernetes/client-node';
-import { regionClients, primaryK8s } from '../config/kubernetes';
-import { K8sManifest } from '../types';
+import dotenv from 'dotenv';
+
+dotenv.config();
+
+export interface K8sClients {
+  k8sApi: k8s.AppsV1Api;
+  coreApi: k8s.CoreV1Api;
+  networkingApi: k8s.NetworkingV1Api;
+  kubeConfig: k8s.KubeConfig;
+}
+
+export interface K8sManifest {
+  deployment: k8s.V1Deployment;
+  service: k8s.V1Service;
+  ingress: k8s.V1Ingress;
+}
 
 /**
- * Generate Kubernetes manifests for an application deployment
+ * Loads kubeconfig from KUBECONFIG_PATH and returns API client instances
+ */
+export function getK8sClients(kubeconfigPath?: string): K8sClients {
+  const configPath = kubeconfigPath || process.env.KUBECONFIG_PATH;
+  const kubeConfig = new k8s.KubeConfig();
+
+  if (configPath) {
+    try {
+      kubeConfig.loadFromFile(configPath);
+    } catch (err: any) {
+      console.warn(`⚠️ Failed to load kubeconfig from ${configPath}: ${err.message}. Falling back to default.`);
+      kubeConfig.loadFromDefault();
+    }
+  } else {
+    kubeConfig.loadFromDefault();
+  }
+
+  const k8sApi = kubeConfig.makeApiClient(k8s.AppsV1Api);
+  const coreApi = kubeConfig.makeApiClient(k8s.CoreV1Api);
+  const networkingApi = kubeConfig.makeApiClient(k8s.NetworkingV1Api);
+
+  return { k8sApi, coreApi, networkingApi, kubeConfig };
+}
+
+/**
+ * Generate typed JS objects (not YAML strings) compatible with @kubernetes/client-node
  */
 export function generateManifest(
   appName: string,
@@ -17,9 +56,10 @@ export function generateManifest(
   registry: string = 'docker.io'
 ): K8sManifest {
   const cleanAppName = appName.toLowerCase().replace(/[^a-z0-9-]/g, '-');
-  const image = `${registry}/${imageTag}`;
+  const image = imageTag.includes('/') ? imageTag : `${registry}/${imageTag}`;
+  const versionTag = imageTag.split(':')[1] || 'latest';
 
-  const deployment = {
+  const deployment: k8s.V1Deployment = {
     apiVersion: 'apps/v1',
     kind: 'Deployment',
     metadata: {
@@ -27,7 +67,7 @@ export function generateManifest(
       namespace,
       labels: {
         app: cleanAppName,
-        version: imageTag.split(':')[1] || 'latest',
+        version: versionTag,
       },
     },
     spec: {
@@ -35,8 +75,8 @@ export function generateManifest(
       strategy: {
         type: 'RollingUpdate',
         rollingUpdate: {
-          maxSurge: 1,
-          maxUnavailable: 0,
+          maxSurge: 1 as any,
+          maxUnavailable: 0 as any,
         },
       },
       selector: {
@@ -48,13 +88,11 @@ export function generateManifest(
         metadata: {
           labels: {
             app: cleanAppName,
-            version: imageTag.split(':')[1] || 'latest',
+            version: versionTag,
           },
         },
         spec: {
-          imagePullSecrets: [
-            { name: 'regcred' },
-          ],
+          imagePullSecrets: [{ name: 'regcred' }],
           containers: [
             {
               name: 'app',
@@ -67,10 +105,10 @@ export function generateManifest(
               readinessProbe: {
                 httpGet: {
                   path: '/health',
-                  port: 3000,
+                  port: 3000 as any,
                 },
-                initialDelaySeconds: 5,
-                periodSeconds: 5,
+                initialDelaySeconds: 3,
+                periodSeconds: 3,
                 failureThreshold: 3,
               },
               resources: {
@@ -90,12 +128,15 @@ export function generateManifest(
     },
   };
 
-  const service = {
+  const service: k8s.V1Service = {
     apiVersion: 'v1',
     kind: 'Service',
     metadata: {
       name: `${cleanAppName}-service`,
       namespace,
+      labels: {
+        app: cleanAppName,
+      },
     },
     spec: {
       selector: {
@@ -104,14 +145,14 @@ export function generateManifest(
       ports: [
         {
           port: 80,
-          targetPort: 3000,
+          targetPort: 3000 as any,
         },
       ],
       type: 'ClusterIP',
     },
   };
 
-  const ingress = {
+  const ingress: k8s.V1Ingress = {
     apiVersion: 'networking.k8s.io/v1',
     kind: 'Ingress',
     metadata: {
@@ -150,7 +191,7 @@ export function generateManifest(
 }
 
 /**
- * Create namespace if it doesn't exist
+ * Ensure namespace exists in the cluster
  */
 export async function ensureNamespace(
   coreApi: k8s.CoreV1Api,
@@ -171,99 +212,111 @@ export async function ensureNamespace(
 }
 
 /**
- * Apply a manifest to the cluster
+ * Creates or replaces Deployment + Service + Ingress using client-node APIs
  */
 export async function applyManifest(
-  client: ReturnType<typeof regionClients.get> extends infer R ? (R extends undefined ? never : R) : never,
-  manifest: object,
-  namespace: string
+  clients: K8sClients,
+  manifest: K8sManifest | { deployment: any; service: any; ingress: any },
+  namespace: string = 'default'
 ): Promise<void> {
-  if (!client) throw new Error('K8s client not available');
+  const { deployment, service, ingress } = manifest;
 
-  const kind = (manifest as any).kind;
-  const name = (manifest as any).metadata.name;
-
+  // 1. Apply Deployment
+  const depName = deployment.metadata?.name!;
   try {
-    switch (kind) {
-      case 'Deployment':
-        try {
-          await client.appsApi.readNamespacedDeployment(name, namespace);
-          await client.appsApi.replaceNamespacedDeployment(name, namespace, manifest);
-        } catch (err: any) {
-          if (err.response?.statusCode === 404) {
-            await client.appsApi.createNamespacedDeployment(namespace, manifest);
-          } else {
-            throw err;
-          }
-        }
-        break;
-
-      case 'Service':
-        try {
-          await client.coreApi.readNamespacedService(name, namespace);
-          await client.coreApi.replaceNamespacedService(name, namespace, manifest);
-        } catch (err: any) {
-          if (err.response?.statusCode === 404) {
-            await client.coreApi.createNamespacedService(namespace, manifest);
-          } else {
-            throw err;
-          }
-        }
-        break;
-
-      case 'Ingress':
-        try {
-          await client.networkingApi.readNamespacedIngress(name, namespace);
-          await client.networkingApi.replaceNamespacedIngress(name, namespace, manifest);
-        } catch (err: any) {
-          if (err.response?.statusCode === 404) {
-            await client.networkingApi.createNamespacedIngress(namespace, manifest);
-          } else {
-            throw err;
-          }
-        }
-        break;
-
-      default:
-        throw new Error(`Unknown manifest kind: ${kind}`);
+    const existing = await clients.k8sApi.readNamespacedDeployment(depName, namespace);
+    const updatedDep = {
+      ...deployment,
+      metadata: {
+        ...deployment.metadata,
+        resourceVersion: existing.body.metadata?.resourceVersion,
+      },
+    };
+    await clients.k8sApi.replaceNamespacedDeployment(depName, namespace, updatedDep);
+  } catch (err: any) {
+    if (err.response?.statusCode === 404) {
+      await clients.k8sApi.createNamespacedDeployment(namespace, deployment);
+    } else {
+      throw err;
     }
-  } catch (err) {
-    console.error(`❌ Failed to apply ${kind}/${name}:`, err);
-    throw err;
+  }
+
+  // 2. Apply Service
+  const svcName = service.metadata?.name!;
+  try {
+    const existing = await clients.coreApi.readNamespacedService(svcName, namespace);
+    const updatedSvc = {
+      ...service,
+      metadata: {
+        ...service.metadata,
+        resourceVersion: existing.body.metadata?.resourceVersion,
+      },
+      spec: {
+        ...service.spec,
+        clusterIP: existing.body.spec?.clusterIP,
+      },
+    };
+    await clients.coreApi.replaceNamespacedService(svcName, namespace, updatedSvc);
+  } catch (err: any) {
+    if (err.response?.statusCode === 404) {
+      await clients.coreApi.createNamespacedService(namespace, service);
+    } else {
+      throw err;
+    }
+  }
+
+  // 3. Apply Ingress
+  const ingName = ingress.metadata?.name!;
+  try {
+    const existing = await clients.networkingApi.readNamespacedIngress(ingName, namespace);
+    const updatedIng = {
+      ...ingress,
+      metadata: {
+        ...ingress.metadata,
+        resourceVersion: existing.body.metadata?.resourceVersion,
+      },
+    };
+    await clients.networkingApi.replaceNamespacedIngress(ingName, namespace, updatedIng);
+  } catch (err: any) {
+    if (err.response?.statusCode === 404) {
+      await clients.networkingApi.createNamespacedIngress(namespace, ingress);
+    } else {
+      throw err;
+    }
   }
 }
 
 /**
- * Wait for deployment rollout to complete
+ * Polls Deployment status every 3s until readyReplicas == spec.replicas
  */
 export async function waitForRollout(
-  client: ReturnType<typeof regionClients.get> extends infer R ? (R extends undefined ? never : R) : never,
+  clients: K8sClients,
   deploymentName: string,
-  namespace: string,
+  namespace: string = 'default',
   timeoutMs: number = 300000
 ): Promise<boolean> {
-  if (!client) throw new Error('K8s client not available');
-
   const startTime = Date.now();
 
   return new Promise((resolve, reject) => {
     const check = async () => {
       try {
-        const { body } = await client.appsApi.readNamespacedDeployment(deploymentName, namespace);
+        const { body } = await clients.k8sApi.readNamespacedDeployment(deploymentName, namespace);
+        const specReplicas = body.spec?.replicas ?? 1;
         const status = body.status;
 
-        if (
+        const isReady =
           status?.readyReplicas !== undefined &&
-          status.readyReplicas === status.replicas &&
-          status.updatedReplicas === status.replicas &&
-          status.unavailableReplicas === 0
-        ) {
+          status.readyReplicas >= specReplicas &&
+          (status.updatedReplicas ?? 0) >= specReplicas &&
+          (status.unavailableReplicas ?? 0) === 0;
+
+        if (isReady) {
           resolve(true);
           return;
         }
 
         if (Date.now() - startTime > timeoutMs) {
-          reject(new Error(`Rollout timed out after ${timeoutMs}ms`));
+          reject(new Error(`Rollout timed out for ${deploymentName} after ${timeoutMs}ms`));
           return;
         }
 
@@ -278,75 +331,53 @@ export async function waitForRollout(
 }
 
 /**
- * Rollback a deployment using kubectl rollout undo
+ * Reads the Ingress resource / manifest and extracts the configured host
+ */
+export function getIngressHost(manifest: K8sManifest | { ingress?: any }): string | null {
+  const ingress = (manifest as any).ingress;
+  if (!ingress?.spec?.rules || ingress.spec.rules.length === 0) {
+    return null;
+  }
+  return ingress.spec.rules[0].host || null;
+}
+
+/**
+ * Re-applies a previously stored manifest (deterministic, no kubectl needed)
  */
 export async function rollbackDeployment(
-  client: ReturnType<typeof regionClients.get> extends infer R ? (R extends undefined ? never : R) : never,
-  deploymentName: string,
-  namespace: string
+  clients: K8sClients,
+  previousManifest: K8sManifest | { deployment: any; service: any; ingress: any },
+  namespace: string = 'default'
 ): Promise<void> {
-  if (!client) throw new Error('K8s client not available');
+  await applyManifest(clients, previousManifest, namespace);
+  const deploymentName = previousManifest.deployment.metadata?.name!;
+  await waitForRollout(clients, deploymentName, namespace);
+}
+
+/**
+ * Cleans up all K8s resources for an app
+ */
+export async function deleteAppResources(
+  clients: K8sClients,
+  appName: string,
+  namespace: string = 'default'
+): Promise<void> {
+  const cleanAppName = appName.toLowerCase().replace(/[^a-z0-9-]/g, '-');
+  const depName = cleanAppName;
+  const svcName = `${cleanAppName}-service`;
+  const ingName = `${cleanAppName}-ingress`;
 
   try {
-    // Get current deployment to find previous revision
-    const { body } = await client.appsApi.readNamespacedDeployment(deploymentName, namespace);
+    await clients.networkingApi.deleteNamespacedIngress(ingName, namespace);
+  } catch (_) {}
 
-    // Patch to trigger rollback by updating annotation
-    const patch = {
-      metadata: {
-        annotations: {
-          'kubectl.kubernetes.io/restartedAt': new Date().toISOString(),
-          'deployment.kubernetes.io/revision': String(
-            parseInt(body.metadata?.annotations?.['deployment.kubernetes.io/revision'] || '1') - 1
-          ),
-        },
-      },
-    };
+  try {
+    await clients.coreApi.deleteNamespacedService(svcName, namespace);
+  } catch (_) {}
 
-    await client.appsApi.patchNamespacedDeployment(
-      deploymentName,
-      namespace,
-      patch,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      { headers: { 'Content-Type': 'application/strategic-merge-patch+json' } }
-    );
-
-    console.log(`✅ Rollback initiated for ${deploymentName}`);
-  } catch (err) {
-    console.error(`❌ Rollback failed for ${deploymentName}:`, err);
-    throw err;
-  }
+  try {
+    await clients.k8sApi.deleteNamespacedDeployment(depName, namespace);
+  } catch (_) {}
 }
 
-/**
- * Alternative rollback: re-apply previous manifest
- */
-export async function rollbackWithManifest(
-  client: ReturnType<typeof regionClients.get> extends infer R ? (R extends undefined ? never : R) : never,
-  manifest: object,
-  namespace: string
-): Promise<void> {
-  await applyManifest(client, manifest, namespace);
-  await waitForRollout(
-    client,
-    (manifest as any).metadata.name,
-    namespace
-  );
-}
-
-/**
- * Get all available region clients
- */
-export function getRegionClients(): Map<string, NonNullable<ReturnType<typeof regionClients.get>>> {
-  const clients = new Map<string, NonNullable<ReturnType<typeof regionClients.get>>>();
-  regionClients.forEach((client, region) => {
-    if (client) clients.set(region, client);
-  });
-  return clients;
-}
-
-export { primaryK8s };
+export default getK8sClients;

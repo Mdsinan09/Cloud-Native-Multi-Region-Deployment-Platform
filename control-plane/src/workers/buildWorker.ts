@@ -1,16 +1,20 @@
 /**
  * BullMQ Build Worker
- * Processes build jobs: clone → build → push → deploy → health check
+ * Processes full deployment pipeline:
+ * QUEUED → CLONING → BUILDING → PUSHING → DEPLOYING → HEALTH_CHECK → SUCCESS
+ *                                                         ↓
+ *                                              HEALTH_CHECK_FAILED → ROLLING_BACK → ROLLED_BACK
  */
 import { Worker, Queue } from 'bullmq';
 import redis from '../config/redis';
 import { pool } from '../config/database';
-import { regionClients } from '../config/kubernetes';
+import { regionClients, primaryK8s } from '../config/kubernetes';
 import {
   updateDeploymentStatus,
   logDeploymentEvent,
   createSubDeployment,
   updateSubDeploymentStatus,
+  storeDeploymentManifest,
   getPreviousSuccessfulDeployment,
 } from '../services/deploymentService';
 import { releaseLock } from '../services/lockService';
@@ -20,8 +24,11 @@ import {
   ensureNamespace,
   applyManifest,
   waitForRollout,
+  getIngressHost,
   rollbackDeployment,
+  K8sClients,
 } from '../services/k8sService';
+import { pollHealthCheck } from '../utils/healthCheck';
 
 // Build queue for adding jobs
 export const buildQueue = new Queue('build-queue', { connection: redis });
@@ -36,17 +43,18 @@ const worker = new Worker(
       repoUrl,
       commitSha,
       appName,
-      namespace,
+      namespace = 'default',
     } = job.data;
 
     const registryUsername = process.env.REGISTRY_USERNAME || '';
     const buildDir = `/tmp/builds/${deploymentId}`;
 
     try {
-      // ─── CLONING ───
+      // ─── 1. CLONING ───
       await updateDeploymentStatus(deploymentId, 'CLONING');
       await logDeploymentEvent(deploymentId, 'CLONING', `Cloning ${repoUrl} at ${commitSha}`);
 
+      // ─── 2. BUILDING & PUSHING ───
       const buildResult = await runBuild(
         {
           repoUrl,
@@ -64,85 +72,84 @@ const worker = new Worker(
         throw new Error(buildResult.error || 'Build failed');
       }
 
-      // ─── PUSHING COMPLETE (runBuild handles BUILDING + PUSHING internally) ───
+      // ─── 3. DEPLOYING ───
       await updateDeploymentStatus(deploymentId, 'DEPLOYING');
       await logDeploymentEvent(deploymentId, 'DEPLOYING', `Deploying image ${buildResult.imageTag}`);
 
-      // ─── DEPLOY TO K8s ───
-      const clients = Array.from(regionClients.entries());
+      // Generate Kubernetes Manifest objects (typed JS objects)
       const host = `${appName}-${deploymentId.slice(0, 8)}.localhost`;
       const manifest = generateManifest(appName, buildResult.imageTag, namespace, host);
 
+      // Save generated manifest in Database as JSONB
+      await storeDeploymentManifest(deploymentId, manifest);
+      await logDeploymentEvent(deploymentId, 'MANIFEST_STORED', 'K8s manifest stored in database');
+
+      // Get target cluster clients
+      const clients: [string, K8sClients][] = regionClients.size > 0
+        ? Array.from(regionClients.entries())
+        : [['us-east-1', primaryK8s]];
+
+      // Apply K8s resources to all target regions/clusters
       for (const [region, client] of clients) {
         try {
           await ensureNamespace(client.coreApi, namespace);
-          await applyManifest(client, manifest.deployment, namespace);
-          await applyManifest(client, manifest.service, namespace);
-          await applyManifest(client, manifest.ingress, namespace);
+          await applyManifest(client, manifest, namespace);
+
+          const ingressHost = getIngressHost(manifest) || host;
+          const healthCheckUrl = `http://${ingressHost}:8080/health`;
 
           await createSubDeployment(
             deploymentId,
             region,
             namespace,
             appName,
-            host,
-            `http://${host}:8080/health`
+            ingressHost,
+            healthCheckUrl
           );
 
-          await logDeploymentEvent(deploymentId, 'MANIFEST_APPLIED', `Applied to ${region}`);
+          await logDeploymentEvent(deploymentId, 'MANIFEST_APPLIED', `Manifest applied to ${region}`);
         } catch (err: any) {
           await logDeploymentEvent(deploymentId, 'DEPLOY_FAILED', `Failed in ${region}: ${err.message}`);
           throw err;
         }
       }
 
-      // ─── WAIT FOR ROLLOUT ───
+      // Wait for rollout (pods ready)
       for (const [region, client] of clients) {
         try {
+          await logDeploymentEvent(deploymentId, 'ROLLOUT_WAITING', `Waiting for rollout in ${region}`);
           await waitForRollout(client, appName, namespace, 300000);
           await logDeploymentEvent(deploymentId, 'ROLLOUT_COMPLETE', `Rollout complete in ${region}`);
         } catch (err: any) {
-          await logDeploymentEvent(deploymentId, 'ROLLOUT_TIMEOUT', `Timeout in ${region}: ${err.message}`);
+          await logDeploymentEvent(deploymentId, 'ROLLOUT_TIMEOUT', `Rollout timeout in ${region}: ${err.message}`);
           throw err;
         }
       }
 
-      // ─── HEALTH CHECK ───
+      // ─── 4. HEALTH CHECK ───
       await updateDeploymentStatus(deploymentId, 'HEALTH_CHECK');
-      await logDeploymentEvent(deploymentId, 'HEALTH_CHECK', `Polling http://${host}:8080/health`);
+      const ingressHost = getIngressHost(manifest) || host;
+      const targetHealthUrl = `http://${ingressHost}:8080/health`;
+      await logDeploymentEvent(deploymentId, 'HEALTH_CHECK', `Polling ${targetHealthUrl}`);
 
-      let healthCheckPassed = false;
-      const maxRetries = 10;
-      const retryInterval = 5000;
-
-      for (let i = 0; i < maxRetries; i++) {
-        try {
-          const response = await fetch(`http://${host}:8080/health`, {
-            method: 'GET',
-            signal: AbortSignal.timeout(5000),
-          });
-
-          if (response.ok) {
-            healthCheckPassed = true;
-            await logDeploymentEvent(deploymentId, 'HEALTH_CHECK_PASS', `Attempt ${i + 1}: ${response.status}`);
-            break;
+      const healthCheckPassed = await pollHealthCheck(targetHealthUrl, {
+        hostHeader: ingressHost,
+        onProgress: async (attempt, maxRetries, success, msg) => {
+          if (success) {
+            await logDeploymentEvent(deploymentId, 'HEALTH_CHECK_PASS', `Attempt ${attempt}/${maxRetries}: ${msg}`);
           } else {
-            await logDeploymentEvent(deploymentId, 'HEALTH_CHECK_RETRY', `Attempt ${i + 1}: ${response.status}`);
+            await logDeploymentEvent(deploymentId, 'HEALTH_CHECK_RETRY', `Attempt ${attempt}/${maxRetries}: ${msg}`);
           }
-        } catch (err: any) {
-          await logDeploymentEvent(deploymentId, 'HEALTH_CHECK_RETRY', `Attempt ${i + 1}: ${err.message}`);
-        }
-
-        await new Promise((resolve) => setTimeout(resolve, retryInterval));
-      }
+        },
+      });
 
       if (healthCheckPassed) {
-        // ─── SUCCESS ───
+        // ─── 5. SUCCESS ───
         await updateDeploymentStatus(deploymentId, 'SUCCESS');
-        await logDeploymentEvent(deploymentId, 'SUCCESS', 'Deployment completed successfully');
+        await logDeploymentEvent(deploymentId, 'SUCCESS', 'Deployment completed successfully and verified healthy');
         await releaseLock(appId);
 
-        // Update sub-deployments
+        // Update all sub-deployments to SUCCESS
         const subResult = await pool.query(
           'SELECT id FROM sub_deployments WHERE deployment_id = $1',
           [deploymentId]
@@ -151,33 +158,70 @@ const worker = new Worker(
           await updateSubDeploymentStatus(row.id, 'SUCCESS');
         }
       } else {
-        // ─── HEALTH CHECK FAILED → ROLLBACK ───
+        // ─── 6. HEALTH CHECK FAILED → ROLLBACK ───
         await updateDeploymentStatus(deploymentId, 'HEALTH_CHECK_FAILED');
-        await logDeploymentEvent(deploymentId, 'HEALTH_CHECK_FAILED', 'Health check failed after max retries');
-
-        await updateDeploymentStatus(deploymentId, 'ROLLING_BACK');
-        await logDeploymentEvent(deploymentId, 'ROLLING_BACK', 'Initiating automatic rollback');
-
-        for (const [region, client] of clients) {
-          try {
-            await rollbackDeployment(client, appName, namespace);
-            await logDeploymentEvent(deploymentId, 'ROLLBACK_SUCCESS', `Rolled back in ${region}`);
-          } catch (err: any) {
-            await logDeploymentEvent(deploymentId, 'ROLLBACK_FAILED', `Failed in ${region}: ${err.message}`);
-          }
-        }
-
-        await updateDeploymentStatus(deploymentId, 'ROLLED_BACK');
-        await logDeploymentEvent(deploymentId, 'ROLLED_BACK', 'Automatic rollback completed');
-        await releaseLock(appId);
-
-        const subResult = await pool.query(
-          'SELECT id FROM sub_deployments WHERE deployment_id = $1',
-          [deploymentId]
+        await logDeploymentEvent(
+          deploymentId,
+          'HEALTH_CHECK_FAILED',
+          'Health check failed after maximum retries'
         );
-        for (const row of subResult.rows) {
-          await updateSubDeploymentStatus(row.id, 'ROLLED_BACK');
+
+        // Fetch last known successful deployment with stored manifest
+        const previous = await getPreviousSuccessfulDeployment(appId, deploymentId);
+
+        if (previous && previous.manifest_json) {
+          await updateDeploymentStatus(deploymentId, 'ROLLING_BACK');
+          await logDeploymentEvent(
+            deploymentId,
+            'ROLLING_BACK',
+            `Initiating deterministic rollback to previous deployment (${previous.commit_sha.slice(0, 7)})`
+          );
+
+          for (const [region, client] of clients) {
+            try {
+              await rollbackDeployment(
+                client,
+                previous.manifest_json as any,
+                namespace
+              );
+              await logDeploymentEvent(
+                deploymentId,
+                'ROLLBACK_SUCCESS',
+                `Re-applied previous manifest successfully in ${region}`
+              );
+            } catch (err: any) {
+              await logDeploymentEvent(
+                deploymentId,
+                'ROLLBACK_FAILED',
+                `Failed rollback in ${region}: ${err.message}`
+              );
+            }
+          }
+
+          // Verify health of rolled-back deployment
+          const prevIngressHost = getIngressHost(previous.manifest_json as any) || host;
+          const prevHealthUrl = `http://${prevIngressHost}:8080/health`;
+          await pollHealthCheck(prevHealthUrl, { hostHeader: prevIngressHost });
+
+          await updateDeploymentStatus(deploymentId, 'ROLLED_BACK');
+          await logDeploymentEvent(deploymentId, 'ROLLED_BACK', 'Automatic rollback to stable version completed');
+
+          const subResult = await pool.query(
+            'SELECT id FROM sub_deployments WHERE deployment_id = $1',
+            [deploymentId]
+          );
+          for (const row of subResult.rows) {
+            await updateSubDeploymentStatus(row.id, 'ROLLED_BACK');
+          }
+        } else {
+          await logDeploymentEvent(
+            deploymentId,
+            'ROLLBACK_SKIPPED',
+            'No previous successful deployment found with stored manifest to roll back to'
+          );
         }
+
+        await releaseLock(appId);
       }
     } catch (err: any) {
       // ─── UNEXPECTED ERROR ───
