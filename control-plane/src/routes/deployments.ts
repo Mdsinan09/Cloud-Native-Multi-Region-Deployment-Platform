@@ -1,5 +1,5 @@
 /**
- * Deployments Routes
+ * Deployments Routes (Phase 2: Multi-Region Support)
  */
 import { Router } from 'express';
 import { pool } from '../config/database';
@@ -14,10 +14,11 @@ import {
   updateDeploymentStatus,
   logDeploymentEvent,
   getPreviousSuccessfulDeployment,
+  updateSubDeploymentStatus,
 } from '../services/deploymentService';
 import { releaseLock } from '../services/lockService';
-import { regionClients, primaryK8s } from '../config/kubernetes';
-import { rollbackDeployment, K8sClients } from '../services/k8sService';
+import { allRegions } from '../config/kubernetes';
+import { rollbackDeployment } from '../services/k8sService';
 
 const router = Router();
 
@@ -61,7 +62,7 @@ router.get(
 
 /**
  * POST /api/deployments/:id/rollback
- * Manual rollback trigger
+ * Manual rollback trigger across ALL regions in parallel
  */
 router.post(
   '/:id/rollback',
@@ -80,7 +81,7 @@ router.post(
     }
 
     await updateDeploymentStatus(deployment.id, 'ROLLING_BACK');
-    await logDeploymentEvent(deployment.id, 'ROLLBACK_INITIATED', 'Manual rollback triggered');
+    await logDeploymentEvent(deployment.id, 'ROLLBACK_INITIATED', 'Manual rollback triggered across all regions');
 
     // Get app info
     const appResult = await pool.query('SELECT * FROM apps WHERE id = $1', [deployment.app_id]);
@@ -93,26 +94,50 @@ router.post(
       return;
     }
 
-    // Rollback in each region
-    const clients: [string, K8sClients][] = regionClients.size > 0
-      ? Array.from(regionClients.entries())
-      : [['us-east-1', primaryK8s]];
-
-    for (const [region, client] of clients) {
-      try {
-        await rollbackDeployment(client, targetDeployment.manifest_json as any, app.namespace || 'default');
-        await logDeploymentEvent(deployment.id, 'ROLLBACK_REGION_SUCCESS', `Rolled back in ${region} to commit ${targetDeployment.commit_sha.slice(0, 7)}`);
-      } catch (err: any) {
-        await logDeploymentEvent(deployment.id, 'ROLLBACK_REGION_FAILED', `Failed in ${region}: ${err.message}`);
-      }
-    }
+    // Rollback across ALL configured regions using Promise.allSettled
+    await Promise.allSettled(
+      allRegions.map(async (regionConfig) => {
+        try {
+          await rollbackDeployment(
+            regionConfig,
+            targetDeployment.manifest_json as any,
+            app.namespace || 'default'
+          );
+          await logDeploymentEvent(
+            deployment.id,
+            'ROLLBACK_REGION_SUCCESS',
+            `Rolled back in ${regionConfig.region} to commit ${targetDeployment.commit_sha.slice(0, 7)}`
+          );
+        } catch (err: any) {
+          await logDeploymentEvent(
+            deployment.id,
+            'ROLLBACK_REGION_FAILED',
+            `Failed in ${regionConfig.region}: ${err.message}`
+          );
+        }
+      })
+    );
 
     await updateDeploymentStatus(deployment.id, 'ROLLED_BACK');
-    await logDeploymentEvent(deployment.id, 'ROLLED_BACK', `Rollback completed to ${targetDeployment.commit_sha.slice(0, 7)}`);
+    await logDeploymentEvent(
+      deployment.id,
+      'ROLLED_BACK',
+      `Manual rollback completed across all regions to ${targetDeployment.commit_sha.slice(0, 7)}`
+    );
+
+    // Update sub-deployments
+    const subResult = await pool.query(
+      'SELECT id FROM sub_deployments WHERE deployment_id = $1',
+      [deployment.id]
+    );
+    for (const row of subResult.rows) {
+      await updateSubDeploymentStatus(row.id, 'ROLLED_BACK');
+    }
+
     await releaseLock(deployment.app_id);
 
     res.json({
-      message: 'Rollback completed',
+      message: 'Rollback completed across all regions',
       deploymentId: deployment.id,
       rolledBackTo: targetDeployment.id,
       commitSha: targetDeployment.commit_sha,

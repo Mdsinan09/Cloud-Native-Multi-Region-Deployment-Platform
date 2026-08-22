@@ -1,6 +1,6 @@
 /**
- * BullMQ Build Worker
- * Processes full deployment pipeline:
+ * BullMQ Build Worker (Phase 2: Multi-Region Parallel Fan-Out)
+ * Processes full deployment pipeline across ALL configured regions in parallel:
  * QUEUED → CLONING → BUILDING → PUSHING → DEPLOYING → HEALTH_CHECK → SUCCESS
  *                                                         ↓
  *                                              HEALTH_CHECK_FAILED → ROLLING_BACK → ROLLED_BACK
@@ -8,7 +8,7 @@
 import { Worker, Queue } from 'bullmq';
 import redis from '../config/redis';
 import { pool } from '../config/database';
-import { regionClients, primaryK8s } from '../config/kubernetes';
+import { allRegions } from '../config/kubernetes';
 import {
   updateDeploymentStatus,
   logDeploymentEvent,
@@ -26,7 +26,6 @@ import {
   waitForRollout,
   getIngressHost,
   rollbackDeployment,
-  K8sClients,
 } from '../services/k8sService';
 import { pollHealthCheck } from '../utils/healthCheck';
 
@@ -72,9 +71,13 @@ const worker = new Worker(
         throw new Error(buildResult.error || 'Build failed');
       }
 
-      // ─── 3. DEPLOYING ───
+      // ─── 3. MULTI-REGION PARALLEL FAN-OUT DEPLOYMENT ───
       await updateDeploymentStatus(deploymentId, 'DEPLOYING');
-      await logDeploymentEvent(deploymentId, 'DEPLOYING', `Deploying image ${buildResult.imageTag}`);
+      await logDeploymentEvent(
+        deploymentId,
+        'DEPLOYING',
+        `Deploying image ${buildResult.imageTag} simultaneously to ${allRegions.length} region(s) [${allRegions.map(r => r.region).join(', ')}]`
+      );
 
       // Generate Kubernetes Manifest objects (typed JS objects)
       const host = `${appName}-${deploymentId.slice(0, 8)}.localhost`;
@@ -84,19 +87,15 @@ const worker = new Worker(
       await storeDeploymentManifest(deploymentId, manifest);
       await logDeploymentEvent(deploymentId, 'MANIFEST_STORED', 'K8s manifest stored in database');
 
-      // Get target cluster clients
-      const clients: [string, K8sClients][] = regionClients.size > 0
-        ? Array.from(regionClients.entries())
-        : [['us-east-1', primaryK8s]];
-
-      // Apply K8s resources to all target regions/clusters
-      for (const [region, client] of clients) {
-        try {
-          await ensureNamespace(client.coreApi, namespace);
-          await applyManifest(client, manifest, namespace);
+      // Deploy to ALL regions in parallel
+      const deployResults = await Promise.allSettled(
+        allRegions.map(async (regionConfig) => {
+          const region = regionConfig.region;
+          await ensureNamespace(regionConfig, namespace);
+          await applyManifest(regionConfig, manifest, namespace);
 
           const ingressHost = getIngressHost(manifest) || host;
-          const healthCheckUrl = `http://${ingressHost}:8080/health`;
+          const healthCheckUrl = `http://${ingressHost}:${regionConfig.ingressPort}/health`;
 
           await createSubDeployment(
             deploymentId,
@@ -107,46 +106,81 @@ const worker = new Worker(
             healthCheckUrl
           );
 
-          await logDeploymentEvent(deploymentId, 'MANIFEST_APPLIED', `Manifest applied to ${region}`);
-        } catch (err: any) {
-          await logDeploymentEvent(deploymentId, 'DEPLOY_FAILED', `Failed in ${region}: ${err.message}`);
-          throw err;
-        }
+          await logDeploymentEvent(deploymentId, 'MANIFEST_APPLIED', `Manifest applied to ${region} (port ${regionConfig.ingressPort})`);
+          return region;
+        })
+      );
+
+      // Verify if any region failed during apply
+      const deployErrors = deployResults.filter((r) => r.status === 'rejected');
+      if (deployErrors.length > 0) {
+        const firstErr = (deployErrors[0] as PromiseRejectedResult).reason;
+        throw new Error(`Deployment apply failed in one or more regions: ${firstErr?.message || firstErr}`);
       }
 
-      // Wait for rollout (pods ready)
-      for (const [region, client] of clients) {
-        try {
-          await logDeploymentEvent(deploymentId, 'ROLLOUT_WAITING', `Waiting for rollout in ${region}`);
-          await waitForRollout(client, appName, namespace, 300000);
-          await logDeploymentEvent(deploymentId, 'ROLLOUT_COMPLETE', `Rollout complete in ${region}`);
-        } catch (err: any) {
-          await logDeploymentEvent(deploymentId, 'ROLLOUT_TIMEOUT', `Rollout timeout in ${region}: ${err.message}`);
-          throw err;
-        }
+      // ─── 4. PARALLEL ROLLOUT WAITING ───
+      const rolloutResults = await Promise.allSettled(
+        allRegions.map(async (regionConfig) => {
+          await logDeploymentEvent(deploymentId, 'ROLLOUT_WAITING', `Waiting for rollout in ${regionConfig.region}`);
+          await waitForRollout(regionConfig, appName, namespace, 300000);
+          await logDeploymentEvent(deploymentId, 'ROLLOUT_COMPLETE', `Rollout complete in ${regionConfig.region}`);
+          return regionConfig.region;
+        })
+      );
+
+      const rolloutErrors = rolloutResults.filter((r) => r.status === 'rejected');
+      if (rolloutErrors.length > 0) {
+        const firstErr = (rolloutErrors[0] as PromiseRejectedResult).reason;
+        throw new Error(`Rollout failed or timed out: ${firstErr?.message || firstErr}`);
       }
 
-      // ─── 4. HEALTH CHECK ───
+      // ─── 5. MULTI-REGION HEALTH CHECK PHASE ───
       await updateDeploymentStatus(deploymentId, 'HEALTH_CHECK');
       const ingressHost = getIngressHost(manifest) || host;
-      const targetHealthUrl = `http://${ingressHost}:8080/health`;
-      await logDeploymentEvent(deploymentId, 'HEALTH_CHECK', `Polling ${targetHealthUrl}`);
 
-      const healthCheckPassed = await pollHealthCheck(targetHealthUrl, {
-        hostHeader: ingressHost,
-        onProgress: async (attempt, maxRetries, success, msg) => {
-          if (success) {
-            await logDeploymentEvent(deploymentId, 'HEALTH_CHECK_PASS', `Attempt ${attempt}/${maxRetries}: ${msg}`);
-          } else {
-            await logDeploymentEvent(deploymentId, 'HEALTH_CHECK_RETRY', `Attempt ${attempt}/${maxRetries}: ${msg}`);
+      const healthCheckResults = await Promise.allSettled(
+        allRegions.map(async (regionConfig) => {
+          const targetHealthUrl = `http://${ingressHost}:${regionConfig.ingressPort}/health`;
+          await logDeploymentEvent(deploymentId, 'HEALTH_CHECK', `Polling ${regionConfig.region} at ${targetHealthUrl}`);
+
+          const passed = await pollHealthCheck(targetHealthUrl, {
+            hostHeader: ingressHost,
+            fallbackPort: regionConfig.ingressPort,
+            onProgress: async (attempt, maxRetries, success, msg) => {
+              if (success) {
+                await logDeploymentEvent(
+                  deploymentId,
+                  'HEALTH_CHECK_PASS',
+                  `[${regionConfig.region}] Attempt ${attempt}/${maxRetries}: ${msg}`
+                );
+              } else {
+                await logDeploymentEvent(
+                  deploymentId,
+                  'HEALTH_CHECK_RETRY',
+                  `[${regionConfig.region}] Attempt ${attempt}/${maxRetries}: ${msg}`
+                );
+              }
+            },
+          });
+
+          if (!passed) {
+            throw new Error(`Health check failed in ${regionConfig.region} after maximum retries`);
           }
-        },
-      });
 
-      if (healthCheckPassed) {
-        // ─── 5. SUCCESS ───
+          return regionConfig.region;
+        })
+      );
+
+      const allHealthy = healthCheckResults.every((r) => r.status === 'fulfilled');
+
+      if (allHealthy) {
+        // ─── 6. SUCCESS (Only when ALL regions pass) ───
         await updateDeploymentStatus(deploymentId, 'SUCCESS');
-        await logDeploymentEvent(deploymentId, 'SUCCESS', 'Deployment completed successfully and verified healthy');
+        await logDeploymentEvent(
+          deploymentId,
+          'SUCCESS',
+          `Deployment completed successfully across ALL ${allRegions.length} regions`
+        );
         await releaseLock(appId);
 
         // Update all sub-deployments to SUCCESS
@@ -158,12 +192,12 @@ const worker = new Worker(
           await updateSubDeploymentStatus(row.id, 'SUCCESS');
         }
       } else {
-        // ─── 6. HEALTH CHECK FAILED → ROLLBACK ───
+        // ─── 7. HEALTH CHECK FAILED → DETERMINISTIC MULTI-REGION ROLLBACK ───
         await updateDeploymentStatus(deploymentId, 'HEALTH_CHECK_FAILED');
         await logDeploymentEvent(
           deploymentId,
           'HEALTH_CHECK_FAILED',
-          'Health check failed after maximum retries'
+          'Health check failed in one or more regions. Triggering cross-region rollback for consistency.'
         );
 
         // Fetch last known successful deployment with stored manifest
@@ -174,37 +208,51 @@ const worker = new Worker(
           await logDeploymentEvent(
             deploymentId,
             'ROLLING_BACK',
-            `Initiating deterministic rollback to previous deployment (${previous.commit_sha.slice(0, 7)})`
+            `Initiating parallel rollback across all regions to commit ${previous.commit_sha.slice(0, 7)}`
           );
 
-          for (const [region, client] of clients) {
-            try {
-              await rollbackDeployment(
-                client,
-                previous.manifest_json as any,
-                namespace
-              );
-              await logDeploymentEvent(
-                deploymentId,
-                'ROLLBACK_SUCCESS',
-                `Re-applied previous manifest successfully in ${region}`
-              );
-            } catch (err: any) {
-              await logDeploymentEvent(
-                deploymentId,
-                'ROLLBACK_FAILED',
-                `Failed rollback in ${region}: ${err.message}`
-              );
-            }
-          }
+          // Re-apply previous manifest across ALL regions in parallel
+          await Promise.allSettled(
+            allRegions.map(async (regionConfig) => {
+              try {
+                await rollbackDeployment(
+                  regionConfig,
+                  previous.manifest_json as any,
+                  namespace
+                );
+                await logDeploymentEvent(
+                  deploymentId,
+                  'ROLLBACK_SUCCESS',
+                  `Re-applied previous manifest in ${regionConfig.region}`
+                );
+              } catch (err: any) {
+                await logDeploymentEvent(
+                  deploymentId,
+                  'ROLLBACK_FAILED',
+                  `Rollback failed in ${regionConfig.region}: ${err.message}`
+                );
+              }
+            })
+          );
 
-          // Verify health of rolled-back deployment
+          // Verify health of rolled-back deployment in parallel
           const prevIngressHost = getIngressHost(previous.manifest_json as any) || host;
-          const prevHealthUrl = `http://${prevIngressHost}:8080/health`;
-          await pollHealthCheck(prevHealthUrl, { hostHeader: prevIngressHost });
+          await Promise.allSettled(
+            allRegions.map(async (regionConfig) => {
+              const prevHealthUrl = `http://${prevIngressHost}:${regionConfig.ingressPort}/health`;
+              await pollHealthCheck(prevHealthUrl, {
+                hostHeader: prevIngressHost,
+                fallbackPort: regionConfig.ingressPort,
+              });
+            })
+          );
 
           await updateDeploymentStatus(deploymentId, 'ROLLED_BACK');
-          await logDeploymentEvent(deploymentId, 'ROLLED_BACK', 'Automatic rollback to stable version completed');
+          await logDeploymentEvent(
+            deploymentId,
+            'ROLLED_BACK',
+            'Cross-region rollback to stable version completed'
+          );
 
           const subResult = await pool.query(
             'SELECT id FROM sub_deployments WHERE deployment_id = $1',

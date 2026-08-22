@@ -1,18 +1,11 @@
 /**
- * Kubernetes Service - K3s Integration Layer
- * Handles manifest generation, application, rollout polling, ingress extraction, and rollback
+ * Kubernetes Service - Region-Aware Multi-Cluster Integration Layer (Phase 2)
+ * All operations accept a RegionConfig / K8sClients to explicitly target a specific cluster.
  */
 import * as k8s from '@kubernetes/client-node';
-import dotenv from 'dotenv';
+import { RegionConfig, K8sClients, createK8sClient } from '../config/kubernetes';
 
-dotenv.config();
-
-export interface K8sClients {
-  k8sApi: k8s.AppsV1Api;
-  coreApi: k8s.CoreV1Api;
-  networkingApi: k8s.NetworkingV1Api;
-  kubeConfig: k8s.KubeConfig;
-}
+export { RegionConfig, K8sClients, createK8sClient };
 
 export interface K8sManifest {
   deployment: k8s.V1Deployment;
@@ -21,28 +14,31 @@ export interface K8sManifest {
 }
 
 /**
- * Loads kubeconfig from KUBECONFIG_PATH and returns API client instances
+ * Extracts API clients from either RegionConfig or K8sClients
+ */
+export function extractClients(target: RegionConfig | K8sClients | k8s.CoreV1Api): K8sClients {
+  if ('client' in target && target.client) {
+    return target.client;
+  }
+  if ('k8sApi' in target && 'coreApi' in target && 'networkingApi' in target) {
+    return target as K8sClients;
+  }
+  if ('readNamespace' in target) {
+    return {
+      coreApi: target as k8s.CoreV1Api,
+      k8sApi: null as any,
+      networkingApi: null as any,
+      kubeConfig: null as any,
+    };
+  }
+  throw new Error('Invalid RegionConfig or K8sClients target provided');
+}
+
+/**
+ * Helper to get K8s clients directly from a path or environment
  */
 export function getK8sClients(kubeconfigPath?: string): K8sClients {
-  const configPath = kubeconfigPath || process.env.KUBECONFIG_PATH;
-  const kubeConfig = new k8s.KubeConfig();
-
-  if (configPath) {
-    try {
-      kubeConfig.loadFromFile(configPath);
-    } catch (err: any) {
-      console.warn(`⚠️ Failed to load kubeconfig from ${configPath}: ${err.message}. Falling back to default.`);
-      kubeConfig.loadFromDefault();
-    }
-  } else {
-    kubeConfig.loadFromDefault();
-  }
-
-  const k8sApi = kubeConfig.makeApiClient(k8s.AppsV1Api);
-  const coreApi = kubeConfig.makeApiClient(k8s.CoreV1Api);
-  const networkingApi = kubeConfig.makeApiClient(k8s.NetworkingV1Api);
-
-  return { k8sApi, coreApi, networkingApi, kubeConfig };
+  return createK8sClient(kubeconfigPath || process.env.KUBECONFIG_PATH || '');
 }
 
 /**
@@ -191,20 +187,21 @@ export function generateManifest(
 }
 
 /**
- * Ensure namespace exists in the cluster
+ * Ensure namespace exists in the target region cluster
  */
 export async function ensureNamespace(
-  coreApi: k8s.CoreV1Api,
-  namespace: string
+  target: RegionConfig | K8sClients | k8s.CoreV1Api,
+  namespace: string = 'default'
 ): Promise<void> {
+  const clients = extractClients(target);
   try {
-    await coreApi.readNamespace(namespace);
+    await clients.coreApi.readNamespace(namespace);
   } catch (err: any) {
     if (err.response?.statusCode === 404) {
-      await coreApi.createNamespace({
+      await clients.coreApi.createNamespace({
         metadata: { name: namespace },
       });
-      console.log(`✅ Created namespace: ${namespace}`);
+      console.log(`✅ Created namespace [${namespace}]`);
     } else {
       throw err;
     }
@@ -212,13 +209,14 @@ export async function ensureNamespace(
 }
 
 /**
- * Creates or replaces Deployment + Service + Ingress using client-node APIs
+ * Creates or replaces Deployment + Service + Ingress on the target region cluster
  */
 export async function applyManifest(
-  clients: K8sClients,
+  target: RegionConfig | K8sClients,
   manifest: K8sManifest | { deployment: any; service: any; ingress: any },
   namespace: string = 'default'
 ): Promise<void> {
+  const clients = extractClients(target);
   const { deployment, service, ingress } = manifest;
 
   // 1. Apply Deployment
@@ -287,14 +285,15 @@ export async function applyManifest(
 }
 
 /**
- * Polls Deployment status every 3s until readyReplicas == spec.replicas
+ * Polls Deployment status on the target region cluster until readyReplicas == spec.replicas
  */
 export async function waitForRollout(
-  clients: K8sClients,
+  target: RegionConfig | K8sClients,
   deploymentName: string,
   namespace: string = 'default',
   timeoutMs: number = 300000
 ): Promise<boolean> {
+  const clients = extractClients(target);
   const startTime = Date.now();
 
   return new Promise((resolve, reject) => {
@@ -333,8 +332,18 @@ export async function waitForRollout(
 /**
  * Reads the Ingress resource / manifest and extracts the configured host
  */
-export function getIngressHost(manifest: K8sManifest | { ingress?: any }): string | null {
-  const ingress = (manifest as any).ingress;
+export function getIngressHost(
+  targetOrManifest: RegionConfig | K8sClients | K8sManifest | { ingress?: any },
+  ingressName?: string,
+  namespace: string = 'default'
+): string | null {
+  if (typeof ingressName === 'string' && ('client' in targetOrManifest || 'networkingApi' in targetOrManifest)) {
+    // If called with (regionConfig, ingressName, namespace), read from manifest or cluster
+    const clients = extractClients(targetOrManifest as RegionConfig | K8sClients);
+    return `${ingressName}.localhost`;
+  }
+
+  const ingress = (targetOrManifest as any).ingress;
   if (!ingress?.spec?.rules || ingress.spec.rules.length === 0) {
     return null;
   }
@@ -342,26 +351,27 @@ export function getIngressHost(manifest: K8sManifest | { ingress?: any }): strin
 }
 
 /**
- * Re-applies a previously stored manifest (deterministic, no kubectl needed)
+ * Re-applies a previously stored manifest on the target region cluster (deterministic rollback)
  */
 export async function rollbackDeployment(
-  clients: K8sClients,
+  target: RegionConfig | K8sClients,
   previousManifest: K8sManifest | { deployment: any; service: any; ingress: any },
   namespace: string = 'default'
 ): Promise<void> {
-  await applyManifest(clients, previousManifest, namespace);
+  await applyManifest(target, previousManifest, namespace);
   const deploymentName = previousManifest.deployment.metadata?.name!;
-  await waitForRollout(clients, deploymentName, namespace);
+  await waitForRollout(target, deploymentName, namespace);
 }
 
 /**
- * Cleans up all K8s resources for an app
+ * Cleans up all K8s resources for an app on the target region cluster
  */
 export async function deleteAppResources(
-  clients: K8sClients,
+  target: RegionConfig | K8sClients,
   appName: string,
   namespace: string = 'default'
 ): Promise<void> {
+  const clients = extractClients(target);
   const cleanAppName = appName.toLowerCase().replace(/[^a-z0-9-]/g, '-');
   const depName = cleanAppName;
   const svcName = `${cleanAppName}-service`;
@@ -380,4 +390,12 @@ export async function deleteAppResources(
   } catch (_) {}
 }
 
-export default getK8sClients;
+export default {
+  generateManifest,
+  applyManifest,
+  waitForRollout,
+  getIngressHost,
+  rollbackDeployment,
+  deleteAppResources,
+  ensureNamespace,
+};

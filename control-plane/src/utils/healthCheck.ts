@@ -1,5 +1,5 @@
 /**
- * Health check utility with polling, retries, timeouts, and k3d localhost fallback
+ * Health check utility with polling, retries, timeouts, and per-region port fallback
  */
 import dotenv from 'dotenv';
 
@@ -7,6 +7,7 @@ dotenv.config();
 
 export interface PollHealthCheckOptions {
   hostHeader?: string;
+  fallbackPort?: number;
   retries?: number;
   intervalMs?: number;
   timeoutMs?: number;
@@ -21,7 +22,7 @@ export interface PollHealthCheckOptions {
 /**
  * Robust health check polling for newly deployed services
  * If the ingress hostname doesn't resolve (no /etc/hosts entry),
- * it falls back to http://localhost:8080 with the Host header set automatically.
+ * it falls back to http://localhost:<fallbackPort> with the Host header set automatically.
  */
 export async function pollHealthCheck(
   url: string,
@@ -40,6 +41,9 @@ export async function pollHealthCheck(
   const parsedUrl = new URL(url);
   const ingressHost = options.hostHeader || parsedUrl.hostname;
   const pathAndQuery = `${parsedUrl.pathname}${parsedUrl.search}`;
+  const fallbackPort =
+    options.fallbackPort ??
+    (parsedUrl.port ? parseInt(parsedUrl.port, 10) : 8080);
 
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     let success = false;
@@ -60,9 +64,9 @@ export async function pollHealthCheck(
         message = `Health check returned status ${response.status} from ${url}`;
       }
     } catch (directErr: any) {
-      // Attempt 2: Fallback to k3d ingress on localhost:8080 with Host header
+      // Attempt 2: Fallback to k3d ingress on localhost:<fallbackPort> with Host header
       try {
-        const fallbackUrl = `http://localhost:8080${pathAndQuery}`;
+        const fallbackUrl = `http://localhost:${fallbackPort}${pathAndQuery}`;
         const fallbackResponse = await fetch(fallbackUrl, {
           method: 'GET',
           headers: {
