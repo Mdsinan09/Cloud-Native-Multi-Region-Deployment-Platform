@@ -5,6 +5,7 @@
   "main": "src/index.ts",
   "scripts": {
     "dev": "wrangler dev",
+    "serve": "tsx src/server.ts",
     "deploy": "wrangler deploy",
     "build": "tsc --noEmit"
   },

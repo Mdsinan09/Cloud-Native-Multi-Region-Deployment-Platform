@@ -242,8 +242,8 @@ export default {
       }
     }
 
-    // ─── ROUTER HEALTH CHECK ───
-    if (url.pathname === '/health' && request.method === 'GET' && !request.headers.get('X-Proxy-Request')) {
+    // ─── ROUTER HEALTH CHECK SUMMARY ───
+    if (url.pathname === '/admin/health' || (url.pathname === '/health' && url.searchParams.get('summary') === 'true')) {
       const config = await loadRegionConfig(env);
       const health = await checkRegionsHealth(config.regions, healthPath, timeoutMs);
       const healthyCount = Array.from(health.values()).filter(Boolean).length;

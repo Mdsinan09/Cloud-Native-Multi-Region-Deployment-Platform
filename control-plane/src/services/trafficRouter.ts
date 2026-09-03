@@ -38,7 +38,7 @@ export function getMultiRegionRouterConfig(
 
   const regions: RegionDefinition[] = allRegions.map((r: RegionConfig) => {
     const countries = REGION_GEO_MAP[r.region] || ['US', 'CA'];
-    const endpoint = `http://127.0.0.1:${r.ingressPort}`;
+    const endpoint = `http://${host}:${r.ingressPort}`;
 
     return {
       region: r.region,
