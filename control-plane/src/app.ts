@@ -24,6 +24,24 @@ app.use(helmet());
 app.use(cors());
 app.use(express.json());
 
+// Root landing
+app.get('/', (_req, res) => {
+  res.json({
+    name: 'Cloud-Native Multi-Region Deployment Platform - Control Plane API',
+    status: 'running',
+    version: '1.0.0',
+    endpoints: {
+      health: '/health',
+      auth: ['/auth/login', '/auth/register'],
+      apps: '/api/apps',
+      deployments: '/api/deployments',
+      regions: '/api/regions',
+      webhooks: '/api/webhooks/github',
+    },
+    dashboardUrl: 'http://localhost:5173',
+  });
+});
+
 // Health check
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
