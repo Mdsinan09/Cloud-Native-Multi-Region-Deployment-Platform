@@ -39,4 +39,33 @@ export function logout(): void {
   window.location.href = '/login'
 }
 
+/* ─── Observability API ─── */
+
+export async function getDeploymentPods(deploymentId: string, region?: string) {
+  const params = region ? { region } : {}
+  return api.get(`/api/observability/${deploymentId}/pods`, { params })
+}
+
+export async function getDeploymentLogs(
+  deploymentId: string,
+  region: string,
+  options?: { tailLines?: number; previous?: boolean; container?: string }
+) {
+  return api.get(`/api/observability/${deploymentId}/logs`, {
+    params: { region, ...options },
+  })
+}
+
+export async function getPodMetrics(deploymentId: string, region: string, podName?: string) {
+  return api.get(`/api/observability/${deploymentId}/metrics`, {
+    params: { region, pod: podName },
+  })
+}
+
+export async function getTopPods(deploymentId: string, region: string) {
+  return api.get(`/api/observability/${deploymentId}/top`, {
+    params: { region },
+  })
+}
+
 export default api

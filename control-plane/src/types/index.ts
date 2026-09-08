@@ -40,10 +40,10 @@ export interface Deployment {
   status: DeploymentStatus;
   image_tag: string | null;
   region: string;
-  manifest_json?: Record<string, unknown> | null;
   started_at: Date | null;
   completed_at: Date | null;
   rollback_to_deployment_id: string | null;
+  manifest_json: Record<string, unknown> | null;
   created_at: Date;
 }
 

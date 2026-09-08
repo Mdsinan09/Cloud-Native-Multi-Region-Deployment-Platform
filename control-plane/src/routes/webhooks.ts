@@ -11,6 +11,7 @@ import { checkIdempotency } from '../services/idempotencyService';
 import { acquireLock } from '../services/lockService';
 import { createDeployment, logDeploymentEvent } from '../services/deploymentService';
 import { buildQueue } from '../workers/buildWorker';
+import { metrics } from '../utils/metrics';
 
 const router = Router();
 
@@ -53,6 +54,8 @@ router.post(
       res.status(401).json({ error: 'Invalid signature' });
       return;
     }
+
+    metrics.inc('webhook_received_total', { event: event || 'unknown' });
 
     // Only handle push events
     if (event !== 'push') {

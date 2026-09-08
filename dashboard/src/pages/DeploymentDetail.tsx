@@ -5,6 +5,8 @@ import { ArrowLeft, RotateCcw } from 'lucide-react';
 import StateMachine from '../components/StateMachine';
 import DeploymentTimeline from '../components/DeploymentTimeline';
 import RegionCard from '../components/RegionCard';
+import PodTable from '../components/PodTable';
+import LogViewer from '../components/LogViewer';
 
 interface Deployment {
   id: string;
@@ -43,11 +45,29 @@ const DeploymentDetail: React.FC = () => {
   const [loading, setLoading] = useState(true);
   const [rollingBack, setRollingBack] = useState(false);
 
+  // Log viewer state
+  const [logViewer, setLogViewer] = useState<{
+    open: boolean;
+    podName: string;
+    region: string;
+  }>({ open: false, podName: '', region: '' });
+
   useEffect(() => {
     fetchDeployment();
     const interval = setInterval(fetchDeployment, 3000);
     return () => clearInterval(interval);
   }, [id]);
+
+  // ESC key to close log viewer
+  useEffect(() => {
+    const handleKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setLogViewer((prev) => ({ ...prev, open: false }));
+      }
+    };
+    window.addEventListener('keydown', handleKey);
+    return () => window.removeEventListener('keydown', handleKey);
+  }, []);
 
   const fetchDeployment = async () => {
     try {
@@ -75,6 +95,10 @@ const DeploymentDetail: React.FC = () => {
     }
   };
 
+  const handleViewLogs = (podName: string, region: string) => {
+    setLogViewer({ open: true, podName, region });
+  };
+
   const canRollback = ['SUCCESS', 'HEALTH_CHECK_FAILED'].includes(deployment?.status || '');
 
   if (loading) return <div className="p-8 text-center">Loading...</div>;
@@ -82,11 +106,15 @@ const DeploymentDetail: React.FC = () => {
 
   return (
     <div className="max-w-6xl mx-auto px-4 py-8">
-      <button onClick={() => navigate(`/apps/${deployment.app_id}`)} className="flex items-center gap-2 text-gray-600 hover:text-gray-900 mb-6">
+      <button
+        onClick={() => navigate(`/apps/${deployment.app_id}`)}
+        className="flex items-center gap-2 text-gray-600 hover:text-gray-900 mb-6"
+      >
         <ArrowLeft className="w-4 h-4" />
         Back to App
       </button>
 
+      {/* Deployment Header + State Machine */}
       <div className="card mb-6">
         <div className="flex items-center justify-between mb-4">
           <div>
@@ -107,6 +135,7 @@ const DeploymentDetail: React.FC = () => {
         <StateMachine status={deployment.status} />
       </div>
 
+      {/* Region Cards */}
       {subDeployments.length > 0 && (
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
           {subDeployments.map((sub) => (
@@ -115,9 +144,27 @@ const DeploymentDetail: React.FC = () => {
         </div>
       )}
 
+      {/* Live Pods Table */}
+      {['DEPLOYING', 'HEALTH_CHECK', 'SUCCESS', 'HEALTH_CHECK_FAILED', 'ROLLING_BACK', 'ROLLED_BACK'].includes(deployment.status) && (
+        <div className="mb-6">
+          <PodTable deploymentId={deployment.id} onViewLogs={handleViewLogs} />
+        </div>
+      )}
+
+      {/* Event Timeline */}
       <div className="card">
         <DeploymentTimeline events={events} />
       </div>
+
+      {/* Log Viewer Modal */}
+      {logViewer.open && (
+        <LogViewer
+          deploymentId={deployment.id}
+          podName={logViewer.podName}
+          region={logViewer.region}
+          onClose={() => setLogViewer({ open: false, podName: '', region: '' })}
+        />
+      )}
     </div>
   );
 };

@@ -13,6 +13,8 @@ import appsRoutes from './routes/apps';
 import deploymentsRoutes from './routes/deployments';
 import webhooksRoutes from './routes/webhooks';
 import regionsRoutes from './routes/regions';
+import observabilityRoutes from './routes/observability';
+import { getPrometheusMetrics } from './utils/metrics';
 
 dotenv.config();
 
@@ -32,10 +34,12 @@ app.get('/', (_req, res) => {
     version: '1.0.0',
     endpoints: {
       health: '/health',
+      metrics: '/metrics',
       auth: ['/auth/login', '/auth/register'],
       apps: '/api/apps',
       deployments: '/api/deployments',
       regions: '/api/regions',
+      observability: '/api/observability/:id/(pods|logs|metrics|top)',
       webhooks: '/api/webhooks/github',
     },
     dashboardUrl: 'http://localhost:5173',
@@ -47,12 +51,19 @@ app.get('/health', (_req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
+// Prometheus metrics endpoint
+app.get('/metrics', (_req, res) => {
+  res.setHeader('Content-Type', 'text/plain; version=0.0.4');
+  res.send(getPrometheusMetrics());
+});
+
 // Routes
 app.use('/auth', authRoutes);
 app.use('/api/apps', appsRoutes);
 app.use('/api/deployments', deploymentsRoutes);
 app.use('/api/webhooks', webhooksRoutes);
 app.use('/api/regions', regionsRoutes);
+app.use('/api/observability', observabilityRoutes);
 
 // Error handler (must be last)
 app.use(errorHandler);
@@ -64,6 +75,7 @@ async function startServer() {
     app.listen(PORT, () => {
       console.log(`🚀 Control Plane running on http://localhost:${PORT}`);
       console.log(`📊 Health check: http://localhost:${PORT}/health`);
+      console.log(`📈 Metrics: http://localhost:${PORT}/metrics`);
     });
   } catch (err) {
     console.error('❌ Failed to start server:', err);

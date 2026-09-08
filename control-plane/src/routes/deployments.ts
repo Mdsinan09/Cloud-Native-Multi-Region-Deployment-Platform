@@ -1,5 +1,5 @@
 /**
- * Deployments Routes (Phase 2: Multi-Region Support)
+ * Deployments Routes
  */
 import { Router } from 'express';
 import { pool } from '../config/database';
@@ -13,12 +13,10 @@ import {
   getDeploymentsByAppId,
   updateDeploymentStatus,
   logDeploymentEvent,
-  getPreviousSuccessfulDeployment,
-  updateSubDeploymentStatus,
 } from '../services/deploymentService';
 import { releaseLock } from '../services/lockService';
-import { allRegions } from '../config/kubernetes';
 import { rollbackDeployment } from '../services/k8sService';
+import { allRegions } from '../config/kubernetes';
 
 const router = Router();
 
@@ -26,7 +24,6 @@ router.use(authenticateToken);
 
 /**
  * GET /api/deployments/:id
- * Get full deployment with events and sub-deployments
  */
 router.get(
   '/:id',
@@ -49,8 +46,7 @@ router.get(
 );
 
 /**
- * GET /api/apps/:id/deployments
- * List deployments for an app
+ * GET /api/deployments/app/:appId
  */
 router.get(
   '/app/:appId',
@@ -62,7 +58,7 @@ router.get(
 
 /**
  * POST /api/deployments/:id/rollback
- * Manual rollback trigger across ALL regions in parallel
+ * Manual rollback — triggers across ALL regions
  */
 router.post(
   '/:id/rollback',
@@ -73,7 +69,6 @@ router.post(
       return;
     }
 
-    // Can only rollback failed or successful deployments
     const rollbackable: DeploymentStatus[] = ['SUCCESS', 'HEALTH_CHECK_FAILED'];
     if (!rollbackable.includes(deployment.status)) {
       res.status(400).json({ error: `Cannot rollback deployment in ${deployment.status} status` });
@@ -81,67 +76,39 @@ router.post(
     }
 
     await updateDeploymentStatus(deployment.id, 'ROLLING_BACK');
-    await logDeploymentEvent(deployment.id, 'ROLLBACK_INITIATED', 'Manual rollback triggered across all regions');
+    await logDeploymentEvent(deployment.id, 'ROLLBACK_INITIATED', 'Manual rollback triggered');
 
-    // Get app info
     const appResult = await pool.query('SELECT * FROM apps WHERE id = $1', [deployment.app_id]);
     const app = appResult.rows[0];
 
-    // Find previous successful deployment with stored manifest
-    const targetDeployment = await getPreviousSuccessfulDeployment(deployment.app_id, deployment.id);
-    if (!targetDeployment || !targetDeployment.manifest_json) {
-      res.status(400).json({ error: 'No previous successful deployment with stored manifest available to rollback to' });
-      return;
-    }
+    if (deployment.manifest_json) {
+      const manifest = deployment.manifest_json as any;
 
-    // Rollback across ALL configured regions using Promise.allSettled
-    await Promise.allSettled(
-      allRegions.map(async (regionConfig) => {
-        try {
-          await rollbackDeployment(
-            regionConfig,
-            targetDeployment.manifest_json as any,
-            app.namespace || 'default'
-          );
+      // Rollback every region
+      const results = await Promise.allSettled(
+        allRegions.map(async (regionConfig) => {
+          await rollbackDeployment(regionConfig, app.name, app.namespace || 'default', manifest);
           await logDeploymentEvent(
             deployment.id,
             'ROLLBACK_REGION_SUCCESS',
-            `Rolled back in ${regionConfig.region} to commit ${targetDeployment.commit_sha.slice(0, 7)}`
+            `Rolled back in ${regionConfig.region}`
           );
-        } catch (err: any) {
-          await logDeploymentEvent(
-            deployment.id,
-            'ROLLBACK_REGION_FAILED',
-            `Failed in ${regionConfig.region}: ${err.message}`
-          );
-        }
-      })
-    );
+        })
+      );
 
-    await updateDeploymentStatus(deployment.id, 'ROLLED_BACK');
-    await logDeploymentEvent(
-      deployment.id,
-      'ROLLED_BACK',
-      `Manual rollback completed across all regions to ${targetDeployment.commit_sha.slice(0, 7)}`
-    );
-
-    // Update sub-deployments
-    const subResult = await pool.query(
-      'SELECT id FROM sub_deployments WHERE deployment_id = $1',
-      [deployment.id]
-    );
-    for (const row of subResult.rows) {
-      await updateSubDeploymentStatus(row.id, 'ROLLED_BACK');
+      const failed = results.filter((r) => r.status === 'rejected');
+      if (failed.length > 0) {
+        await logDeploymentEvent(deployment.id, 'ROLLBACK_REGION_FAILED', `${failed.length} region(s) failed`);
+      }
+    } else {
+      await logDeploymentEvent(deployment.id, 'ROLLBACK_NO_MANIFEST', 'No stored manifest found');
     }
 
+    await updateDeploymentStatus(deployment.id, 'ROLLED_BACK');
+    await logDeploymentEvent(deployment.id, 'ROLLED_BACK', 'Manual rollback completed');
     await releaseLock(deployment.app_id);
 
-    res.json({
-      message: 'Rollback completed across all regions',
-      deploymentId: deployment.id,
-      rolledBackTo: targetDeployment.id,
-      commitSha: targetDeployment.commit_sha,
-    });
+    res.json({ message: 'Rollback completed', deploymentId: deployment.id });
   })
 );
 

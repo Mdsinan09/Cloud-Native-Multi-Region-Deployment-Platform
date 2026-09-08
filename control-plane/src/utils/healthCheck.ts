@@ -1,16 +1,16 @@
 /**
- * Health check utility with polling, retries, timeouts, and per-region port fallback
+ * Health Check Polling Utility — Phase 2 Multi-Region
+ *
+ * Robust HTTP polling with retries, timeouts, and per-region
+ * ingress port fallback for local k3d clusters.
  */
-import dotenv from 'dotenv';
-
-dotenv.config();
 
 export interface PollHealthCheckOptions {
-  hostHeader?: string;
-  fallbackPort?: number;
   retries?: number;
   intervalMs?: number;
   timeoutMs?: number;
+  fallbackPort?: number; // e.g. 8080 for us-east-1, 8081 for ap-south-1
+  hostHeader?: string;
   onProgress?: (
     attempt: number,
     maxRetries: number,
@@ -19,87 +19,117 @@ export interface PollHealthCheckOptions {
   ) => Promise<void> | void;
 }
 
+export interface PollHealthCheckResult {
+  success: boolean;
+  lastStatus?: number;
+  lastError?: string;
+}
+
 /**
- * Robust health check polling for newly deployed services
- * If the ingress hostname doesn't resolve (no /etc/hosts entry),
- * it falls back to http://localhost:<fallbackPort> with the Host header set automatically.
+ * Poll a health endpoint until it returns HTTP 200 or max retries exhausted.
+ *
+ * For local k3d, if the hostname doesn't resolve, falls back to
+ * http://localhost:{fallbackPort} with the Host header set to the ingress host.
  */
 export async function pollHealthCheck(
   url: string,
   options: PollHealthCheckOptions = {}
-): Promise<boolean> {
-  const maxRetries =
-    options.retries ??
-    parseInt(process.env.HEALTH_CHECK_RETRIES || '10', 10);
-  const retryInterval =
-    options.intervalMs ??
-    parseInt(process.env.HEALTH_CHECK_INTERVAL_MS || '5000', 10);
-  const timeoutMs =
-    options.timeoutMs ??
-    parseInt(process.env.HEALTH_CHECK_TIMEOUT_MS || '3000', 10);
+): Promise<PollHealthCheckResult> {
+  const {
+    retries = 10,
+    intervalMs = 5000,
+    timeoutMs = 3000,
+    fallbackPort = 8080,
+    hostHeader,
+    onProgress,
+  } = options;
 
-  const parsedUrl = new URL(url);
-  const ingressHost = options.hostHeader || parsedUrl.hostname;
-  const pathAndQuery = `${parsedUrl.pathname}${parsedUrl.search}`;
-  const fallbackPort =
-    options.fallbackPort ??
-    (parsedUrl.port ? parseInt(parsedUrl.port, 10) : 8080);
+  let lastStatus: number | undefined;
+  let lastError: string | undefined;
 
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    let success = false;
-    let message = '';
+  const parsed = new URL(url);
+  const ingressHost = hostHeader || parsed.hostname;
+  const path = parsed.pathname + parsed.search;
 
-    // Attempt 1: Direct request to target URL
+  for (let attempt = 1; attempt <= retries; attempt++) {
     try {
-      const response = await fetch(url, {
-        method: 'GET',
-        headers: options.hostHeader ? { Host: options.hostHeader } : undefined,
-        signal: AbortSignal.timeout(timeoutMs),
-      });
+      // Try direct URL first
+      let response = await fetchWithTimeout(url, timeoutMs, hostHeader ? { Host: hostHeader } : undefined);
 
-      if (response.ok) {
-        success = true;
-        message = `Health check OK (${response.status}) directly via ${url}`;
-      } else {
-        message = `Health check returned status ${response.status} from ${url}`;
-      }
-    } catch (directErr: any) {
-      // Attempt 2: Fallback to k3d ingress on localhost:<fallbackPort> with Host header
-      try {
-        const fallbackUrl = `http://localhost:${fallbackPort}${pathAndQuery}`;
-        const fallbackResponse = await fetch(fallbackUrl, {
-          method: 'GET',
-          headers: {
-            Host: ingressHost,
-          },
-          signal: AbortSignal.timeout(timeoutMs),
+      // If DNS fails, fall back to localhost:{fallbackPort} with Host header
+      if (!response && ingressHost !== 'localhost') {
+        const fallbackUrl = `http://localhost:${fallbackPort}${path}`;
+        response = await fetchWithTimeout(fallbackUrl, timeoutMs, {
+          Host: ingressHost,
         });
+      }
 
-        if (fallbackResponse.ok) {
-          success = true;
-          message = `Health check OK (${fallbackResponse.status}) via k3d fallback (${fallbackUrl} with Host: ${ingressHost})`;
+      if (response) {
+        lastStatus = response.status;
+
+        if (response.ok) {
+          console.log(`✅ [Attempt ${attempt}/${retries}] Health check passed for ${url}`);
+          if (onProgress) {
+            await onProgress(attempt, retries, true, `Health check OK (${response.status})`);
+          }
+          return { success: true, lastStatus };
         } else {
-          message = `Fallback returned status ${fallbackResponse.status} from ${fallbackUrl}`;
+          lastError = `HTTP ${response.status}`;
+          console.log(`⚠️ [Attempt ${attempt}/${retries}] Health check returned ${response.status} for ${url}`);
+          if (onProgress) {
+            await onProgress(attempt, retries, false, `Returned status ${response.status}`);
+          }
         }
-      } catch (fallbackErr: any) {
-        message = `Request failed: ${directErr.message} (fallback error: ${fallbackErr.message})`;
+      } else {
+        lastError = 'Connection failed';
+        console.log(`⚠️ [Attempt ${attempt}/${retries}] Could not connect to ${url}`);
+        if (onProgress) {
+          await onProgress(attempt, retries, false, 'Connection failed');
+        }
+      }
+    } catch (err: any) {
+      lastError = err.message || 'Unknown error';
+      console.log(`⚠️ [Attempt ${attempt}/${retries}] Health check error for ${url}:`, lastError);
+      if (onProgress) {
+        await onProgress(attempt, retries, false, lastError || 'Unknown error');
       }
     }
 
-    if (options.onProgress) {
-      await options.onProgress(attempt, maxRetries, success, message);
-    }
-
-    if (success) {
-      return true;
-    }
-
-    if (attempt < maxRetries) {
-      await new Promise((resolve) => setTimeout(resolve, retryInterval));
+    if (attempt < retries) {
+      await sleep(intervalMs);
     }
   }
 
-  return false;
+  console.error(`❌ Health check failed after ${retries} attempts for ${url}`);
+  return { success: false, lastStatus, lastError };
+}
+
+/**
+ * Fetch with timeout and custom headers, returning null on network errors.
+ */
+async function fetchWithTimeout(
+  url: string,
+  timeoutMs: number,
+  headers?: Record<string, string>
+): Promise<Response | null> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const res = await fetch(url, {
+      signal: controller.signal,
+      headers: headers || {},
+    });
+    return res;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 export default pollHealthCheck;
