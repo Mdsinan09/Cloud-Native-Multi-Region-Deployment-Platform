@@ -81,29 +81,40 @@ router.post(
     }
 
     const payload = JSON.parse(rawBody);
-    const repoUrl = payload.repository?.clone_url;
+    const repoUrl = payload.repository?.clone_url || payload.repository?.git_url || payload.repository?.html_url;
     const repoFullName = payload.repository?.full_name;
     const commitSha = payload.after;
     const commitMessage = payload.head_commit?.message || null;
     const branch = payload.ref?.replace('refs/heads/', '') || null;
+
+    console.log(`📦 Webhook push received for repo: ${repoUrl || repoFullName}, commit: ${commitSha}, branch: ${branch}`);
 
     if (!repoUrl || !commitSha) {
       res.status(400).json({ error: 'Missing repository URL or commit SHA' });
       return;
     }
 
-    // Find app by repo URL
+    // Find app by repo URL (flexible matching with or without .git and case-insensitive)
+    const cleanRepoUrl = repoUrl.replace(/\.git$/, '').toLowerCase();
     const appResult = await pool.query(
-      'SELECT * FROM apps WHERE repo_url = $1',
-      [repoUrl]
+      `SELECT * FROM apps 
+       WHERE LOWER(REPLACE(repo_url, '.git', '')) = $1 
+          OR LOWER(repo_url) = $2
+          OR LOWER(repo_url) = $3
+          OR ($4::text IS NOT NULL AND repo_url ILIKE '%' || $4 || '%')
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [cleanRepoUrl, repoUrl.toLowerCase(), `${cleanRepoUrl}.git`, repoFullName]
     );
 
     if (appResult.rows.length === 0) {
-      res.status(404).json({ error: 'No app configured for this repository' });
+      console.warn(`⚠️ No app found for repo URL: ${repoUrl} (clean: ${cleanRepoUrl}, full: ${repoFullName})`);
+      res.status(404).json({ error: `No app configured for this repository: ${repoUrl}` });
       return;
     }
 
     const app = appResult.rows[0];
+    console.log(`✅ Webhook matched app: [${app.name}] (ID: ${app.id})`);
 
     // Check idempotency
     const idempotency = await checkIdempotency(app.id, commitSha);
