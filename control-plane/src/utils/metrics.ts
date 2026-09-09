@@ -134,6 +134,10 @@ class MetricsRegistry {
 
 export const metrics = new MetricsRegistry();
 
+// Initialize base gauges
+metrics.gauge('active_deployments', 0);
+metrics.inc('deployment_total', { status: 'INITIALIZED', region: 'all' }, 0);
+
 /**
  * Get formatted Prometheus metrics string.
  */

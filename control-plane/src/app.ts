@@ -14,7 +14,7 @@ import deploymentsRoutes from './routes/deployments';
 import webhooksRoutes from './routes/webhooks';
 import regionsRoutes from './routes/regions';
 import observabilityRoutes from './routes/observability';
-import { getPrometheusMetrics } from './utils/metrics';
+import { metrics, getPrometheusMetrics } from './utils/metrics';
 
 dotenv.config();
 
@@ -52,8 +52,40 @@ app.get('/health', (_req, res) => {
 });
 
 // Prometheus metrics endpoint
-app.get('/metrics', (_req, res) => {
+app.get('/metrics', async (_req, res) => {
   res.setHeader('Content-Type', 'text/plain; version=0.0.4');
+  try {
+    const { pool } = await import('./config/database');
+    const statusCounts = await pool.query(
+      'SELECT status, COUNT(*)::int as count FROM deployments GROUP BY status'
+    );
+    for (const row of statusCounts.rows) {
+      metrics.inc('deployment_total', { status: row.status, region: 'all' }, 0);
+      const counter = (metrics as any).counters?.get('deployment_total')?.find(
+        (c: any) => c.labels.status === row.status && c.labels.region === 'all'
+      );
+      if (counter) counter.value = row.count;
+    }
+
+    const activeRes = await pool.query(
+      "SELECT COUNT(*)::int as count FROM deployments WHERE status IN ('QUEUED', 'BUILDING', 'DEPLOYING')"
+    );
+    metrics.gauge('active_deployments', activeRes.rows[0]?.count || 0);
+
+    const durationsRes = await pool.query(
+      "SELECT EXTRACT(EPOCH FROM (updated_at - created_at)) as duration FROM deployments WHERE status = 'SUCCESS' AND updated_at IS NOT NULL"
+    );
+    if (durationsRes.rows.length > 0) {
+      for (const row of durationsRes.rows) {
+        if (row.duration && Number(row.duration) > 0) {
+          metrics.observe('deployment_duration_seconds', Number(row.duration));
+        }
+      }
+    }
+  } catch (err: any) {
+    // Fallback to in-memory metrics
+  }
+
   res.send(getPrometheusMetrics());
 });
 
