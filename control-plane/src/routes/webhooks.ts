@@ -20,10 +20,15 @@ const GITHUB_WEBHOOK_SECRET = process.env.GITHUB_WEBHOOK_SECRET || '';
 /**
  * Validate GitHub HMAC signature
  */
-function validateHmac(rawBody: string, signature: string): boolean {
+function validateHmac(rawBody: string, signature?: string): boolean {
   if (!GITHUB_WEBHOOK_SECRET) {
     console.warn('⚠️ GITHUB_WEBHOOK_SECRET not set, skipping HMAC validation');
     return true;
+  }
+
+  if (!signature) {
+    console.warn('⚠️ No signature header provided on webhook request');
+    return false;
   }
 
   const hmac = crypto.createHmac('sha256', GITHUB_WEBHOOK_SECRET);
@@ -31,7 +36,12 @@ function validateHmac(rawBody: string, signature: string): boolean {
   const digest = `sha256=${hmac.digest('hex')}`;
 
   try {
-    return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(signature));
+    const digestBuffer = Buffer.from(digest);
+    const signatureBuffer = Buffer.from(signature);
+    if (digestBuffer.length !== signatureBuffer.length) {
+      return false;
+    }
+    return crypto.timingSafeEqual(digestBuffer, signatureBuffer);
   } catch {
     return false;
   }
@@ -49,9 +59,16 @@ router.post(
     const event = req.headers['x-github-event'] as string;
     const rawBody = (req as Request & { rawBody?: string }).rawBody || '';
 
+    // Handle GitHub ping event immediately (sent when configuring/testing webhook)
+    if (event === 'ping') {
+      console.log('✅ Received GitHub webhook ping event! Connection verified.');
+      res.status(200).json({ status: 'ok', message: 'Pong! Webhook connected successfully' });
+      return;
+    }
+
     // Validate HMAC
     if (!validateHmac(rawBody, signature)) {
-      res.status(401).json({ error: 'Invalid signature' });
+      res.status(401).json({ error: 'Invalid signature. Please ensure the secret in GitHub matches GITHUB_WEBHOOK_SECRET in .env' });
       return;
     }
 
