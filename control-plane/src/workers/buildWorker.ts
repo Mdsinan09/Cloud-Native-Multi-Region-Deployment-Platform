@@ -119,7 +119,8 @@ const worker = new Worker(
             `http://${host}:${regionConfig.ingressPort}/health`
           );
 
-          await waitForRollout(regionConfig, cleanAppName, namespace, 120000);
+          const rolloutTimeout = parseInt(process.env.ROLLOUT_TIMEOUT_MS || '300000', 10);
+          await waitForRollout(regionConfig, cleanAppName, namespace, rolloutTimeout);
           await log('ROLLOUT_COMPLETE', `Pods ready in ${regionConfig.region}`);
 
           return { regionConfig, subDep };
